@@ -12,11 +12,13 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 
 from hydro_utils import (
     CSS, DEFAULT_SHEET_URL, METRIC_KEYS, METRICS,
     cards_grid_html, evaluate, filter_window, header_html, load_sheet, metric_card_html,
     remove_outliers, summary_stats, tank_html, thermo_html,
+    SOUND_LABELS, SOUND_PRIORITY, alert_event_html, make_wav_base64, sound_player_html,
 )
 
 TZ = ZoneInfo("Asia/Bangkok")
@@ -26,6 +28,8 @@ LOCAL_CSV = os.getenv("HYDRO_CSV")  # ใช้ทดสอบกับไฟล
 
 STATS_WINDOWS = {"15 นาที": 15, "1 ชั่วโมง": 60, "6 ชั่วโมง": 360, "24 ชั่วโมง": 1440,
                  "7 วัน": 10080, "ทั้งหมด": None}
+SOUND_MODES = ["ดังซ้ำจนกว่าจะกดรับทราบ", "ดังครั้งเดียวตอนเริ่มเกินเกณฑ์"]
+MAX_EVENTS = 300                     # เก็บ log ไว้สูงสุดกี่เหตุการณ์
 RESAMPLE_RULES = {"1 นาที": "1min", "5 นาที": "5min", "15 นาที": "15min", "1 ชั่วโมง": "1h", "1 วัน": "1D"}
 
 st.set_page_config(page_title="HYDROMETRICS · IoT Telemetry", page_icon="💧", layout="wide")
@@ -46,7 +50,8 @@ def default_sheet_url() -> str:
 def init_state():
     ss = st.session_state
     ss.setdefault("sheet_url", default_sheet_url())
-    ss.setdefault("alert_log", [])
+    ss.setdefault("alert_events", [])         # log เหตุการณ์แจ้งเตือน (ใหม่สุดอยู่บน)
+    ss.setdefault("ev_seq", 0)
     ss.setdefault("last_alert_ts", None)
     ss.setdefault("toast_on", True)
     ss.setdefault("auto_refresh", True)
@@ -55,6 +60,10 @@ def init_state():
     ss.setdefault("stats_window", "1 ชั่วโมง")
     ss.setdefault("clean_outliers", True)
     ss.setdefault("ma_window", 10)
+    ss.setdefault("sound_on", True)           # เปิดเสียงแจ้งเตือน
+    ss.setdefault("sound_volume", 70)         # ความดัง 0–100
+    ss.setdefault("sound_mode", SOUND_MODES[0])
+    ss.setdefault("sound_nonce", 0)
     for k, m in METRICS.items():
         ss.setdefault(f"th_{k}_on", True)
         ss.setdefault(f"th_{k}_min", m.default_min)
@@ -71,6 +80,18 @@ def reset_thresholds():
         st.session_state[f"th_{k}_min"] = m.default_min
         st.session_state[f"th_{k}_max"] = m.default_max
         st.session_state[f"th_{k}_on"] = True
+
+
+@st.cache_data(show_spinner=False)
+def wav(kind: str) -> str:
+    return make_wav_base64(kind)
+
+
+def play_sound(kind: str):
+    """เล่นเสียงในเบราว์เซอร์ (iframe สูง 0 จึงมองไม่เห็น)"""
+    st.session_state.sound_nonce += 1
+    components.html(sound_player_html(wav(kind), st.session_state.sound_volume / 100,
+                                      f"{kind}-{st.session_state.sound_nonce}"), height=0)
 
 
 @st.cache_data(ttl=MIN_REFRESH_SEC, show_spinner=False)
@@ -118,6 +139,19 @@ with st.sidebar:
             c2.number_input("สูงสุด", key=f"th_{k}_max", step=0.1, format="%.1f")
     st.button("คืนค่าเริ่มต้นทั้งหมด", on_click=reset_thresholds)
     st.toggle("แสดงป๊อปอัปเมื่อเกินเกณฑ์", key="toast_on")
+
+    st.divider()
+    st.markdown("### 🔊 เสียงแจ้งเตือน")
+    st.toggle("เปิดเสียงเมื่อเกินเกณฑ์", key="sound_on")
+    st.slider("ความดัง", 0, 100, step=5, key="sound_volume")
+    st.radio("เล่นเสียงเมื่อ", SOUND_MODES, key="sound_mode",
+             help="ดังซ้ำ = ดังทุกครั้งที่มีข้อมูลใหม่ ตราบใดที่ยังมีเหตุการณ์สถานะ 'ใหม่' ที่ยังเกินเกณฑ์อยู่ "
+                  "(กดรับทราบแล้วจะเงียบ) · ครั้งเดียว = ดังเฉพาะตอนเกิดเหตุการณ์ใหม่")
+    test_kind = st.selectbox("ทดสอบเสียง", list(SOUND_LABELS), format_func=SOUND_LABELS.get)
+    if st.button("▶️ เล่นเสียงทดสอบ"):
+        play_sound(test_kind)
+    st.caption("เบราว์เซอร์จะยอมให้เล่นเสียงหลังจากคลิกบนหน้าเว็บอย่างน้อย 1 ครั้ง "
+               "— เปิดหน้าแล้วกด 'เล่นเสียงทดสอบ' ก่อน 1 ครั้ง")
 
 
 # ------------------------------------------------------------------
@@ -236,26 +270,131 @@ def histogram_chart(dfw: pd.DataFrame, k: str) -> go.Figure:
 # ------------------------------------------------------------------
 # Alerts
 # ------------------------------------------------------------------
+def _open_event(k: str) -> dict | None:
+    """เหตุการณ์ของเซนเซอร์นี้ที่ยังเปิดอยู่ (ยังไม่กลับสู่ปกติ และยังไม่ถูกกด 'แก้ไขแล้ว')"""
+    for ev in st.session_state.alert_events:
+        if ev["metric"] == k and ev["normal_at"] is None and ev["status"] != "แก้ไขแล้ว":
+            return ev
+    return None
+
+
 def check_alerts(df: pd.DataFrame):
+    """ตรวจแถวล่าสุด: เกินเกณฑ์ → เปิดเหตุการณ์ใหม่ หรืออัปเดตเหตุการณ์เดิม (ไม่สร้างซ้ำทุกแถว)"""
     latest = df.iloc[0]
     ts = latest["timestamp"]
     if st.session_state.last_alert_ts == ts:
         return
     st.session_state.last_alert_ts = ts
+    new_events, still_new = [], []
     for k, m in METRICS.items():
         lo, hi, on = thresholds(k)
-        if not on:
-            continue
-        s = evaluate(latest[k], lo, hi)
+        v = latest[k]
+        ev = _open_event(k)
+        s = evaluate(v, lo, hi) if on else "normal"
         if s in ("low", "high"):
-            cond = f"< {lo:g}" if s == "low" else f"> {hi:g}"
-            st.session_state.alert_log.insert(0, {
-                "เวลา": ts, "พารามิเตอร์": m.name_th, "ค่า": round(float(latest[k]), 2),
-                "หน่วย": m.unit, "เงื่อนไข": cond, "ข้อความ": m.alert_msg,
-            })
-            if st.session_state.toast_on:
-                st.toast(f"⚠️ {m.alert_msg} ({latest[k]:.2f} {m.unit})")
-    del st.session_state.alert_log[200:]
+            worse = (lambda a, b: a < b) if s == "low" else (lambda a, b: a > b)
+            if ev is None:
+                st.session_state.ev_seq += 1
+                ev = {"id": st.session_state.ev_seq, "metric": k, "severity": m.severity,
+                      "cond": f"< {lo:g} or > {hi:g} {m.unit}", "start": ts, "last": ts, "count": 1,
+                      "first_value": float(v), "last_value": float(v), "worst_value": float(v),
+                      "normal_at": None, "status": "ใหม่", "status_at": None, "note": ""}
+                st.session_state.alert_events.insert(0, ev)
+                new_events.append(ev)
+                if st.session_state.toast_on:
+                    st.toast(f"⚠️ {m.alert_msg} ({v:.2f} {m.unit})")
+            else:
+                ev["last"], ev["count"], ev["last_value"] = ts, ev["count"] + 1, float(v)
+                if worse(v, ev["worst_value"]):
+                    ev["worst_value"] = float(v)
+            if ev["status"] == "ใหม่":
+                still_new.append(ev)
+        elif s == "normal" and ev is not None:
+            ev["normal_at"] = ts          # กลับสู่ปกติ → ปิดเหตุการณ์อัตโนมัติ (ยังรอให้กดรับทราบ)
+    del st.session_state.alert_events[MAX_EVENTS:]
+
+    # เสียง
+    to_sound = still_new if st.session_state.sound_mode == SOUND_MODES[0] else new_events
+    if st.session_state.sound_on and to_sound:
+        kinds = {METRICS[e["metric"]].sound for e in to_sound}
+        play_sound(next((x for x in SOUND_PRIORITY if x in kinds), "beep"))  # เล่นเสียงที่ด่วนที่สุดเสียงเดียว
+
+
+def _find_event(ev_id: int) -> dict | None:
+    return next((e for e in st.session_state.alert_events if e["id"] == ev_id), None)
+
+
+def set_event_status(ev_id: int, status: str, note_key: str | None = None):
+    ev = _find_event(ev_id)
+    if ev:
+        ev["status"], ev["status_at"] = status, datetime.now(TZ).replace(tzinfo=None)
+        if note_key:
+            ev["note"] = st.session_state.get(note_key, "")
+
+
+def ack_all():
+    now = datetime.now(TZ).replace(tzinfo=None)
+    for ev in st.session_state.alert_events:
+        if ev["status"] == "ใหม่":
+            ev["status"], ev["status_at"] = "รับทราบ", now
+
+
+def clear_closed_events():
+    """ลบเหตุการณ์ที่จบแล้ว (กลับสู่ปกติหรือแก้ไขแล้ว และไม่ใช่สถานะ 'ใหม่')"""
+    st.session_state.alert_events = [
+        e for e in st.session_state.alert_events
+        if e["status"] == "ใหม่" or (e["normal_at"] is None and e["status"] != "แก้ไขแล้ว")
+    ]
+
+
+def render_alert_log():
+    events = st.session_state.alert_events
+    n_new = sum(e["status"] == "ใหม่" for e in events)
+    n_open = sum(e["normal_at"] is None and e["status"] != "แก้ไขแล้ว" for e in events)
+    st.markdown(f'<div class="hm-section"><span>ประวัติเหตุการณ์แจ้งเตือน</span>'
+                f'<small>{n_new} ใหม่ · {n_open} ยังเกินเกณฑ์ · ทั้งหมด {len(events)}</small></div>',
+                unsafe_allow_html=True)
+    c1, c2, c3, c4, c5 = st.columns([1.1, 1.3, 1.1, 1, 1])
+    sev = c1.selectbox("ความรุนแรง", ["ทั้งหมด", "critical", "warning"], key="lg_sev")
+    met = c2.selectbox("พารามิเตอร์", ["ทั้งหมด"] + METRIC_KEYS, key="lg_met",
+                       format_func=lambda k: k if k == "ทั้งหมด" else METRICS[k].name_th)
+    stt = c3.selectbox("สถานะ", ["ยังไม่แก้ไข", "ใหม่", "รับทราบ", "แก้ไขแล้ว", "ทั้งหมด"], key="lg_stt")
+    c4.button("✅ รับทราบทั้งหมด", on_click=ack_all, disabled=n_new == 0, key="lg_ackall")
+    c5.button("🗑️ ลบที่จบแล้ว", on_click=clear_closed_events, key="lg_clear",
+              help="ลบเหตุการณ์ที่กลับสู่ปกติ/แก้ไขแล้ว และกดรับทราบไปแล้ว")
+
+    view = [e for e in events
+            if (sev == "ทั้งหมด" or e["severity"] == sev)
+            and (met == "ทั้งหมด" or e["metric"] == met)
+            and (stt == "ทั้งหมด" or (e["status"] != "แก้ไขแล้ว" if stt == "ยังไม่แก้ไข" else e["status"] == stt))]
+    if not view:
+        st.info("ไม่มีเหตุการณ์ตามตัวกรองนี้" if events else "ยังไม่มีการแจ้งเตือนตั้งแต่เปิดหน้านี้")
+        return
+    for ev in view[:50]:
+        prefix = "evd" if ev["status"] == "แก้ไขแล้ว" else ("evc" if ev["severity"] == "critical" else "evw")
+        with st.container(key=f"{prefix}-{ev['id']}"):
+            st.markdown(alert_event_html(ev), unsafe_allow_html=True)
+            if ev["status"] != "แก้ไขแล้ว":
+                b1, b2, _ = st.columns([1, 1, 3])
+                if ev["status"] == "ใหม่":
+                    b1.button("✔️ รับทราบ", key=f"ack-{ev['id']}", on_click=set_event_status,
+                              args=(ev["id"], "รับทราบ"))
+                with b2.popover("🔧 แก้ไขแล้ว"):
+                    st.text_input("บันทึกการแก้ไข (ไม่บังคับ)", key=f"note-{ev['id']}",
+                                  placeholder="เช่น เติมน้ำ / เปลี่ยนเซนเซอร์")
+                    st.button("ยืนยันปิดเหตุการณ์", key=f"done-{ev['id']}", on_click=set_event_status,
+                              args=(ev["id"], "แก้ไขแล้ว", f"note-{ev['id']}"), type="primary")
+    if len(view) > 50:
+        st.caption(f"แสดง 50 จาก {len(view)} รายการ — ใช้ตัวกรองเพื่อดูรายการอื่น")
+
+    export = pd.DataFrame([{
+        "id": e["id"], "ความรุนแรง": e["severity"], "พารามิเตอร์": METRICS[e["metric"]].name_th,
+        "เริ่ม": e["start"], "ล่าสุด": e["last"], "จำนวนครั้ง": e["count"], "ค่าแรก": e["first_value"],
+        "ค่าหนักสุด": e["worst_value"], "เงื่อนไข": e["cond"], "กลับสู่ปกติ": e["normal_at"],
+        "สถานะ": e["status"], "เวลาเปลี่ยนสถานะ": e["status_at"], "หมายเหตุ": e["note"],
+    } for e in events])
+    st.download_button("⬇️ ดาวน์โหลด log (CSV)", export.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"alert_log_{datetime.now(TZ):%Y%m%d_%H%M}.csv", mime="text/csv")
 
 
 # ------------------------------------------------------------------
@@ -278,9 +417,11 @@ def dashboard():
     dfw = filter_window(df, STATS_WINDOWS[win_label])
     latest = raw.iloc[0]
     age = (datetime.now(TZ).replace(tzinfo=None) - latest["timestamp"]).total_seconds()
-    st.markdown(header_html(len(raw), latest["timestamp"], refresh_label, fetched_at,
-                            age < STALE_AFTER_SEC, st.session_state.sheet_url), unsafe_allow_html=True)
     check_alerts(raw)
+    new_events = [e for e in st.session_state.alert_events if e["status"] == "ใหม่"]
+    st.markdown(header_html(len(raw), latest["timestamp"], refresh_label, fetched_at,
+                            age < STALE_AFTER_SEC, st.session_state.sheet_url, len(new_events)),
+                unsafe_allow_html=True)
 
     stats = {k: {"min": dfw[k].min(), "avg": dfw[k].mean(), "max": dfw[k].max()} for k in METRIC_KEYS}
 
@@ -290,6 +431,12 @@ def dashboard():
 
     # ---- Tab 1: Overview ----
     with tabs[0]:
+        if new_events:
+            names = ", ".join(dict.fromkeys(METRICS[e["metric"]].name_th for e in new_events))
+            b1, b2 = st.columns([5, 1], vertical_alignment="center")
+            b1.markdown(f'<div class="hm-banner">🚨 <b>มีการแจ้งเตือนที่ยังไม่รับทราบ {len(new_events)} รายการ</b>'
+                        f' — {names} · ดูรายละเอียดที่แท็บ 🔔 บันทึกการแจ้งเตือน</div>', unsafe_allow_html=True)
+            b2.button("✅ รับทราบทั้งหมด", on_click=ack_all, key="ov_ackall")
         st.markdown(f'<div class="hm-section"><span>ค่าเซนเซอร์หลัก 5 ตัวแปร (Latest Telemetry)</span>'
                     f'<small>{latest["timestamp"]:%Y-%m-%d %H:%M:%S} · {latest["remark"]}</small></div>',
                     unsafe_allow_html=True)
@@ -386,13 +533,7 @@ def dashboard():
 
     # ---- Tab 7: Alert log ----
     with tabs[6]:
-        log = st.session_state.alert_log
-        if not log:
-            st.info("ยังไม่มีการแจ้งเตือนตั้งแต่เปิดหน้านี้")
-        else:
-            st.dataframe(pd.DataFrame(log), hide_index=True)
-            if st.button("ล้างบันทึก"):
-                st.session_state.alert_log = []
+        render_alert_log()
 
 
 def render_stats(dfw: pd.DataFrame, win_label: str):

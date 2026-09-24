@@ -6,7 +6,12 @@ hydro_utils.py — ฟังก์ชันช่วย (ไม่ขึ้น�
 """
 from __future__ import annotations
 
+import base64
+import io
+import math
 import re
+import struct
+import wave
 from dataclasses import dataclass
 from datetime import datetime
 from html import escape
@@ -54,6 +59,8 @@ class Metric:
     default_max: float
     alert_msg: str
     valid_max: float = 100.0   # ค่าเกินนี้ถือว่าเซนเซอร์อ่านผิด (ใช้เมื่อเปิด "กรองค่าผิดปกติ")
+    sound: str = "beep"        # เสียงเตือน: "siren" (ด่วน) | "beep" | "chime" (เบา)
+    severity: str = "warning"  # ระดับความรุนแรงใน log: "critical" | "warning"
 
 
 METRICS: dict[str, Metric] = {
@@ -61,22 +68,75 @@ METRICS: dict[str, Metric] = {
     for m in [
         Metric("waterSensorDistance", "ระยะห่างเซนเซอร์วัดผิวน้ำ", "Water Sensor Distance",
                "ระยะห่างจากหัวเซนเซอร์ถึงระดับผิวน้ำ", "cm", "SENSOR_01", "#0ea5e9",
-               15.0, 28.0, "ระยะเซนเซอร์วัดระดับน้ำผิดปกติ", valid_max=50),
+               15.0, 28.0, "ระยะเซนเซอร์วัดระดับน้ำผิดปกติ", valid_max=50, sound="beep"),
         Metric("waterLevel", "ระดับความสูงของน้ำ", "Water Level",
                "ระดับความสูงของน้ำจริงภายในถัง", "cm", "LEVEL_CALC", "#3b82f6",
-               4.5, 25.0, "ระดับน้ำต่ำหรือสูงเกินเกณฑ์ปลอดภัย!", valid_max=40),
+               4.5, 25.0, "ระดับน้ำต่ำหรือสูงเกินเกณฑ์ปลอดภัย!", valid_max=40, sound="siren", severity="critical"),
         Metric("colorSensorDistance", "ระยะห่างเซนเซอร์สี", "Color Sensor Distance",
                "ระยะห่างจากเซนเซอร์แสงถึงผิวน้ำยา/สารละลายสี", "cm", "COLOR_01", "#a855f7",
-               15.0, 25.0, "ระยะเซนเซอร์วัดสีผิดปกติ", valid_max=50),
+               15.0, 25.0, "ระยะเซนเซอร์วัดสีผิดปกติ", valid_max=50, sound="beep"),
         Metric("colorLevel", "ระดับสารละลายสี", "Color Level",
                "ระดับความสูงของสารละลายสี", "cm", "SAT_INDEX", "#ec4899",
-               5.0, 15.0, "ระดับสารละลายสีไม่ได้มาตรฐาน", valid_max=40),
+               5.0, 15.0, "ระดับสารละลายสีไม่ได้มาตรฐาน", valid_max=40, sound="chime"),
         Metric("waterTemperature", "อุณหภูมิน้ำ", "Water Temperature",
                "อุณหภูมิของน้ำแบบเรียลไทม์", "°C", "THERMAL_01", "#f97316",
-               22.0, 35.0, "อุณหภูมิน้ำสูงหรือต่ำเกินกำหนด!", valid_max=60),
+               22.0, 35.0, "อุณหภูมิน้ำสูงหรือต่ำเกินกำหนด!", valid_max=60, sound="siren", severity="critical"),
     ]
 }
 METRIC_KEYS = list(METRICS.keys())
+
+
+# ------------------------------------------------------------------
+# 2.1) เสียงแจ้งเตือน (สร้างไฟล์ WAV ในโค้ด ไม่ต้องมีไฟล์เสียงแยก)
+# ------------------------------------------------------------------
+SOUND_LABELS = {"siren": "ไซเรน (ด่วน)", "beep": "บี๊บ 3 ครั้ง", "chime": "กริ๊ง (เบา)"}
+SOUND_PRIORITY = ["siren", "beep", "chime"]  # ถ้าเกินหลายตัวพร้อมกัน เล่นเสียงที่ด่วนที่สุด
+
+
+def make_wav_base64(kind: str, rate: int = 16000) -> str:
+    """สร้างเสียงเตือนเป็น WAV (base64) ตามชนิด siren / beep / chime"""
+    samples: list[float] = []
+
+    def tone(freq_fn, dur, env=lambda t, d: 1.0):
+        n = int(rate * dur)
+        phase = 0.0
+        for i in range(n):
+            t = i / rate
+            phase += 2 * math.pi * freq_fn(t) / rate
+            samples.append(math.sin(phase) * env(t, dur))
+
+    def silence(dur):
+        samples.extend([0.0] * int(rate * dur))
+
+    fade = lambda t, d: min(1.0, t / 0.01, (d - t) / 0.01)  # กันเสียงแตกตอนเริ่ม/จบ
+    if kind == "siren":
+        for _ in range(2):
+            tone(lambda t: 650 + 550 * (t / 0.8), 0.8, fade)     # ไล่ขึ้น
+            tone(lambda t: 1200 - 550 * (t / 0.8), 0.8, fade)    # ไล่ลง
+    elif kind == "chime":
+        tone(lambda t: 1046.5, 0.45, lambda t, d: math.exp(-5 * t) * min(1, t / 0.005))
+        tone(lambda t: 1318.5, 0.9, lambda t, d: math.exp(-4 * t) * min(1, t / 0.005))
+    else:  # beep
+        for _ in range(3):
+            tone(lambda t: 1000, 0.16, fade)
+            silence(0.09)
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(b"".join(struct.pack("<h", int(max(-1, min(1, x)) * 30000)) for x in samples))
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def sound_player_html(b64: str, volume: float, nonce: str) -> str:
+    """HTML เล็ก ๆ ที่เล่นเสียงทันทีเมื่อแสดงผล (nonce ทำให้เล่นซ้ำได้ทุกครั้ง)"""
+    return f"""<!-- {nonce} --><script>
+const a = new Audio("data:audio/wav;base64,{b64}");
+a.volume = {max(0.0, min(1.0, volume)):.2f};
+a.play().catch(() => {{}});
+</script>"""
 
 
 # ------------------------------------------------------------------
@@ -287,8 +347,42 @@ def thermo_html(temp, lo: float, hi: float) -> str:
 </div>""")
 
 
+def alert_event_html(ev: dict) -> str:
+    """การ์ดเหตุการณ์แจ้งเตือน 1 รายการ (ปุ่มกดอยู่ใน app.py)"""
+    m = METRICS[ev["metric"]]
+    sev = ev["severity"]
+    status_cls = {"ใหม่": "new", "รับทราบ": "ack", "แก้ไขแล้ว": "done"}[ev["status"]]
+    fmt = lambda t: t.strftime("%Y-%m-%d %H:%M:%S")
+    dur = ev["last"] - ev["start"]
+    mins, secs = divmod(int(dur.total_seconds()), 60)
+    if ev["normal_at"] is not None:
+        state = f'<span class="hm-ev-normal">✓ กลับสู่ปกติ {fmt(ev["normal_at"])}</span>'
+    elif ev["status"] == "แก้ไขแล้ว":
+        state = ""
+    else:
+        state = '<span class="hm-ev-live">● ยังเกินเกณฑ์</span>'
+    status_line = ""
+    if ev["status"] != "ใหม่":
+        status_line = (f'<div class="hm-ev-status">{ev["status"]} เมื่อ {fmt(ev["status_at"])}'
+                       + (f' · หมายเหตุ: {escape(ev["note"])}' if ev.get("note") else "") + "</div>")
+    return _clean(f"""
+<div class="hm-ev-head">
+  <span class="hm-sev {sev}">{sev.upper()}</span>
+  <b class="hm-ev-name">{escape(m.name_th)}</b>
+  <span class="hm-ev-status-pill {status_cls}">{ev["status"]}</span>
+  <span class="hm-ev-time">🕒 {fmt(ev["start"])}</span>
+</div>
+<div class="hm-ev-msg">{escape(m.alert_msg)} ({ev["first_value"]:.2f} {m.unit})</div>
+<div class="hm-ev-foot">
+  <span>Trigger: <b>{ev["first_value"]:.2f} {m.unit}</b> <i>({escape(ev["cond"])})</i></span>
+  <span>ล่าสุด <b>{ev["last_value"]:.2f}</b> · หนักสุด <b>{ev["worst_value"]:.2f}</b> · {ev["count"]} ครั้ง · {mins} นาที {secs} วินาที</span>
+  {state}
+</div>
+{status_line}""")
+
+
 def header_html(n_rows: int, latest_ts, refresh_label: str, fetched_at: datetime,
-                is_fresh: bool, sheet_url: str) -> str:
+                is_fresh: bool, sheet_url: str, alerts_new: int = 0) -> str:
     dot = "#10b981" if is_fresh else "#f59e0b"
     state = "ออนไลน์" if is_fresh else "ไม่มีข้อมูลใหม่"
     ts = latest_ts.strftime("%Y-%m-%d %H:%M:%S") if latest_ts is not None and not pd.isna(latest_ts) else "—"
@@ -305,6 +399,7 @@ def header_html(n_rows: int, latest_ts, refresh_label: str, fetched_at: datetime
     <div><small>LAST FETCH</small><b>{fetched_at:%H:%M:%S}</b></div>
     <div><small>LATEST DATA</small><b>{ts}</b></div>
     <span class="hm-online"><i style="background:{dot}"></i>{state} | {n_rows:,} แถว</span>
+    {f'<span class="hm-bell">🔔 {alerts_new} ใหม่</span>' if alerts_new else '<span class="hm-bell zero">🔔 0</span>'}
     <a class="hm-link" href="{escape(sheet_url)}" target="_blank">เปิดชีต ↗</a>
   </div>
 </div>""")
@@ -328,6 +423,32 @@ html, body, [class*="css"], .stMarkdown, .stTabs, button, input, label { font-fa
 .hm-badge { border:1px solid #155e75; background:#083344; color:#22d3ee; padding:3px 10px; border-radius:6px; font-size:.72rem; font-weight:700; }
 .hm-online { border:1px solid #1e293b; background:#0b1220; padding:6px 12px; border-radius:8px; color:#cbd5e1; font-size:.78rem; }
 .hm-online i { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:7px; box-shadow:0 0 8px currentColor; }
+.hm-bell { background:#e11d48; color:#fff; font-weight:700; font-size:.78rem; padding:5px 12px; border-radius:999px;
+  box-shadow:0 0 14px -2px #e11d48; animation:hm-pulse 1.6s infinite; }
+.hm-bell.zero { background:#0f172a; color:#64748b; box-shadow:none; animation:none; border:1px solid #1e293b; }
+@keyframes hm-pulse { 50% { opacity:.65; } }
+/* การ์ดเหตุการณ์แจ้งเตือน (ใช้ key ของ st.container → class st-key-...) */
+div[class*="st-key-evc-"], div[class*="st-key-evw-"], div[class*="st-key-evd-"] {
+  border-radius:12px; padding:14px 16px; gap:.4rem; }
+div[class*="st-key-evc-"] { border:1px solid #be123c; background:#1a0710; }
+div[class*="st-key-evw-"] { border:1px solid #b45309; background:#170f06; }
+div[class*="st-key-evd-"] { border:1px solid #1e293b; background:#0b1120; opacity:.75; }
+.hm-ev-head { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+.hm-sev { font-family:'JetBrains Mono',monospace; font-size:.68rem; font-weight:700; padding:2px 8px; border-radius:5px; }
+.hm-sev.critical { background:#e11d48; color:#fff; } .hm-sev.warning { background:#f59e0b; color:#1c1917; }
+.hm-ev-name { color:#f1f5f9; font-size:.95rem; }
+.hm-ev-time { margin-left:auto; color:#94a3b8; font-family:'JetBrains Mono',monospace; font-size:.75rem; }
+.hm-ev-status-pill { font-size:.68rem; padding:1px 8px; border-radius:999px; border:1px solid; }
+.hm-ev-status-pill.new { color:#fb7185; border-color:#9f1239; } .hm-ev-status-pill.ack { color:#38bdf8; border-color:#075985; }
+.hm-ev-status-pill.done { color:#34d399; border-color:#065f46; }
+.hm-ev-msg { color:#e2e8f0; font-weight:600; font-size:.88rem; margin:6px 0; }
+.hm-ev-foot { display:flex; flex-wrap:wrap; gap:6px 18px; border-top:1px solid #ffffff14; padding-top:8px;
+  font-family:'JetBrains Mono',monospace; font-size:.72rem; color:#94a3b8; }
+.hm-ev-foot b { color:#f8fafc; } .hm-ev-foot i { color:#64748b; font-style:normal; }
+.hm-ev-live { color:#fb7185; } .hm-ev-normal { color:#34d399; }
+.hm-ev-status { color:#64748b; font-size:.72rem; margin-top:6px; }
+.hm-banner { display:flex; align-items:center; gap:12px; background:#1a0710; border:1px solid #be123c; border-radius:10px;
+  padding:10px 14px; color:#fecdd3; font-size:.85rem; margin:6px 0; }
 .hm-link { color:#22d3ee !important; font-size:.8rem; text-decoration:none; }
 .hm-section { color:#f1f5f9; font-weight:700; font-size:1.15rem; margin:10px 0 6px; display:flex; justify-content:space-between; align-items:center; }
 .hm-section::before { content:''; width:10px; height:10px; border-radius:50%; background:#22d3ee; margin-right:10px; display:inline-block; }
