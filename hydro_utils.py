@@ -1,0 +1,352 @@
+"""
+hydro_utils.py — ฟังก์ชันช่วย (ไม่ขึ้นกับ Streamlit)
+- ตั้งค่าเซนเซอร์/เกณฑ์เตือน (แก้ค่าเริ่มต้นได้ที่ METRICS)
+- ดึงและแปลงข้อมูลจาก Google Sheets
+- สร้าง HTML สำหรับการ์ดและภาพจำลองถัง
+"""
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from datetime import datetime
+from html import escape
+
+import pandas as pd
+
+# ------------------------------------------------------------------
+# 1) ตั้งค่าแหล่งข้อมูล
+# ------------------------------------------------------------------
+DEFAULT_SHEET_URL = (
+    "https://docs.google.com/spreadsheets/d/"
+    "19kCwzCFPpCL-Y7iVZ9jZebH41KsS8a4IQyeUJcQwfos/edit?usp=sharing"
+)
+# gid ของแท็บที่เก็บข้อมูลเซนเซอร์ (ถ้า URL มี #gid=... จะใช้ค่านั้นแทน)
+DEFAULT_GID = "1767381986"
+
+# ความสูงถัง (cm) ใช้คำนวณ % ในภาพจำลอง ถ้า None จะใช้ ระยะห่าง + ระดับ
+TANK_HEIGHT_CM: float | None = None
+
+# ลำดับคอลัมน์ในชีต (อ่านตามตำแหน่ง ไม่สนชื่อหัวคอลัมน์)
+COLUMNS = [
+    "timestamp",
+    "waterSensorDistance",
+    "waterLevel",
+    "colorSensorDistance",
+    "colorLevel",
+    "waterTemperature",
+    "remark",
+]
+
+
+# ------------------------------------------------------------------
+# 2) ตั้งค่าเซนเซอร์ + เกณฑ์เตือนเริ่มต้น  ← แก้ตรงนี้ได้เลย
+# ------------------------------------------------------------------
+@dataclass(frozen=True)
+class Metric:
+    key: str
+    name_th: str
+    name_en: str
+    desc_th: str
+    unit: str
+    tag: str
+    color: str
+    default_min: float
+    default_max: float
+    alert_msg: str
+
+
+METRICS: dict[str, Metric] = {
+    m.key: m
+    for m in [
+        Metric("waterSensorDistance", "ระยะห่างเซนเซอร์วัดผิวน้ำ", "Water Sensor Distance",
+               "ระยะห่างจากหัวเซนเซอร์ถึงระดับผิวน้ำ", "cm", "SENSOR_01", "#0ea5e9",
+               15.0, 28.0, "ระยะเซนเซอร์วัดระดับน้ำผิดปกติ"),
+        Metric("waterLevel", "ระดับความสูงของน้ำ", "Water Level",
+               "ระดับความสูงของน้ำจริงภายในถัง", "cm", "LEVEL_CALC", "#3b82f6",
+               4.5, 25.0, "ระดับน้ำต่ำหรือสูงเกินเกณฑ์ปลอดภัย!"),
+        Metric("colorSensorDistance", "ระยะห่างเซนเซอร์สี", "Color Sensor Distance",
+               "ระยะห่างจากเซนเซอร์แสงถึงผิวน้ำยา/สารละลายสี", "cm", "COLOR_01", "#a855f7",
+               15.0, 25.0, "ระยะเซนเซอร์วัดสีผิดปกติ"),
+        Metric("colorLevel", "ระดับสารละลายสี", "Color Level",
+               "ระดับความสูงของสารละลายสี", "cm", "SAT_INDEX", "#ec4899",
+               5.0, 15.0, "ระดับสารละลายสีไม่ได้มาตรฐาน"),
+        Metric("waterTemperature", "อุณหภูมิน้ำ", "Water Temperature",
+               "อุณหภูมิของน้ำแบบเรียลไทม์", "°C", "THERMAL_01", "#f97316",
+               22.0, 35.0, "อุณหภูมิน้ำสูงหรือต่ำเกินกำหนด!"),
+    ]
+}
+METRIC_KEYS = list(METRICS.keys())
+
+
+# ------------------------------------------------------------------
+# 3) ข้อมูล
+# ------------------------------------------------------------------
+def build_csv_url(sheet_url: str) -> str:
+    """แปลงลิงก์ Google Sheet ปกติ → ลิงก์ export เป็น CSV"""
+    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", sheet_url)
+    if not m:
+        raise ValueError("ลิงก์ Google Sheet ไม่ถูกต้อง")
+    gid_m = re.search(r"[#&?]gid=(\d+)", sheet_url)
+    gid = gid_m.group(1) if gid_m else DEFAULT_GID
+    return f"https://docs.google.com/spreadsheets/d/{m.group(1)}/export?format=csv&gid={gid}"
+
+
+def parse_telemetry(raw: pd.DataFrame) -> pd.DataFrame:
+    """ทำความสะอาดข้อมูล: ตั้งชื่อคอลัมน์, แปลงชนิด, เรียงใหม่สุดก่อน"""
+    df = raw.iloc[:, : len(COLUMNS)].copy()
+    df.columns = COLUMNS[: df.shape[1]]
+    if "remark" not in df:
+        df["remark"] = "OK"
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    for k in METRIC_KEYS:
+        df[k] = pd.to_numeric(df[k], errors="coerce")  # ช่องว่าง → NaN (ไม่ใช่ 0)
+    df["remark"] = df["remark"].fillna("").astype(str).str.strip().replace("", "OK")
+    df = df.dropna(subset=["timestamp"]).dropna(subset=METRIC_KEYS, how="all")
+    df = df.sort_values("timestamp", ascending=False, kind="stable").reset_index(drop=True)
+    return df
+
+
+def load_sheet(sheet_url: str, local_csv: str | None = None) -> pd.DataFrame:
+    src = local_csv or build_csv_url(sheet_url)
+    return parse_telemetry(pd.read_csv(src))
+
+
+def evaluate(value: float, lo: float, hi: float) -> str:
+    """คืนค่า 'normal' | 'low' | 'high' | 'nodata'"""
+    if value is None or pd.isna(value):
+        return "nodata"
+    if value < lo:
+        return "low"
+    if value > hi:
+        return "high"
+    return "normal"
+
+
+# ------------------------------------------------------------------
+# 4) HTML components
+# ------------------------------------------------------------------
+def _clean(html: str) -> str:
+    """ลบการเว้นบรรทัด/ย่อหน้า เพื่อไม่ให้ Markdown ตีความเป็น code block"""
+    return "".join(line.strip() for line in html.splitlines())
+
+
+def _fmt(v, nd=1) -> str:
+    return "—" if v is None or pd.isna(v) else f"{v:.{nd}f}"
+
+
+def delta_badge(cur, prev) -> str:
+    if cur is None or prev is None or pd.isna(cur) or pd.isna(prev):
+        return '<span class="hm-delta flat">— 0.0</span>'
+    d = cur - prev
+    if abs(d) < 0.05:
+        return '<span class="hm-delta flat">— 0.0</span>'
+    cls, arrow = ("up", "▲") if d > 0 else ("down", "▼")
+    return f'<span class="hm-delta {cls}">{arrow} {d:+.1f}</span>'
+
+
+def metric_card_html(m: Metric, series: pd.Series, lo: float, hi: float, stats: dict) -> str:
+    cur = series.iloc[0] if len(series) else None
+    prev = series.iloc[1] if len(series) > 1 else None
+    status = evaluate(cur, lo, hi)
+    status_txt = {
+        "normal": ("ok", "✓ ปกติ"),
+        "low": ("bad", "▼ ต่ำกว่าเกณฑ์"),
+        "high": ("bad", "▲ สูงกว่าเกณฑ์"),
+        "nodata": ("warn", "ไม่มีข้อมูล"),
+    }[status]
+
+    # มินิบาร์ 6 ค่าล่าสุด (เก่า → ใหม่)
+    tail = series.iloc[:6][::-1].tolist()
+    valid = [v for v in tail if not pd.isna(v)]
+    vmin, vmax = (min(valid), max(valid)) if valid else (0, 1)
+    span = (vmax - vmin) or 1
+
+    def _h(v):  # สเกลตามช่วง min–max ของ 6 ค่าล่าสุด ให้เห็นความต่าง
+        return 10 if pd.isna(v) else 30 + 70 * (v - vmin) / span
+
+    bars = "".join(
+        f'<div class="hm-bar" style="height:{_h(v):.0f}%;background:{m.color};'
+        f'opacity:{1 if i == len(tail) - 1 else 0.35}"></div>'
+        for i, v in enumerate(tail)
+    )
+    return _clean(f"""
+<div class="hm-card {'alert' if status in ('low','high') else ''}" style="--accent:{m.color}">
+  <div class="hm-card-head">
+    <div><div class="hm-card-title">{escape(m.name_th)}</div>
+    <div class="hm-card-desc">{escape(m.desc_th)}</div></div>
+    <span class="hm-tag">{m.tag}</span>
+  </div>
+  <div class="hm-value-row">
+    <span class="hm-value">{_fmt(cur)}</span><span class="hm-unit">{m.unit}</span>
+    {delta_badge(cur, prev)}
+  </div>
+  <div class="hm-bars">{bars}</div>
+  <div class="hm-stats">
+    <span>MIN <b>{_fmt(stats['min'])}</b></span>
+    <span>AVG <b>{_fmt(stats['avg'])}</b></span>
+    <span>MAX <b>{_fmt(stats['max'])}</b></span>
+  </div>
+  <div class="hm-card-foot">
+    <span class="hm-status {status_txt[0]}">{status_txt[1]}</span>
+    <span class="hm-range">{lo:g} – {hi:g} {m.unit}</span>
+  </div>
+</div>""")
+
+
+def tank_html(title: str, icon: str, sensor_label: str, level, dist, color_from: str,
+              color_to: str, accent: str, level_label: str) -> str:
+    total = TANK_HEIGHT_CM or ((0 if pd.isna(level) else level) + (0 if pd.isna(dist) else dist))
+    pct = 0 if not total or pd.isna(level) else max(0, min(100, level / total * 100))
+    fill = max(6, pct)
+    return _clean(f"""
+<div class="hm-panel" style="--accent:{accent}">
+  <div class="hm-panel-head"><span>{icon} {escape(title)}</span>
+    <span class="hm-chip">{_fmt(level, 2)} cm</span></div>
+  <div class="hm-tank">
+    <div class="hm-tank-sensor"><span>◉ {sensor_label}</span><span>Gap: {_fmt(dist, 2)} cm</span></div>
+    <div class="hm-tank-air" style="height:{100 - fill}%">
+      <div class="hm-beam"></div>
+      <div class="hm-beam-label">ระยะห่าง: {_fmt(dist, 2)} cm</div>
+    </div>
+    <div class="hm-liquid" style="height:{fill}%;background:linear-gradient(to top,{color_to},{color_from})">
+      <div class="hm-liquid-label">{escape(level_label)}: {_fmt(level, 2)} cm</div>
+    </div>
+  </div>
+  <div class="hm-tank-foot">เซนเซอร์: <b>{_fmt(dist)}</b> cm · ระดับ: <b style="color:{accent}">{_fmt(level)}</b> cm
+   · <span style="color:#64748b">{pct:.0f}%</span></div>
+</div>""")
+
+
+def thermo_html(temp, lo: float, hi: float) -> str:
+    pct = 0 if pd.isna(temp) else max(4, min(100, temp / 50 * 100))
+    status = evaluate(temp, lo, hi)
+    label = {"normal": "ปกติ", "low": "เย็นเกิน", "high": "ร้อนเกิน", "nodata": "—"}[status]
+    cls = "ok" if status == "normal" else "bad"
+    return _clean(f"""
+<div class="hm-panel" style="--accent:#f97316">
+  <div class="hm-panel-head"><span>🌡 เกจวัดอุณหภูมิน้ำ</span>
+    <span class="hm-status {cls}">{label}</span></div>
+  <div class="hm-thermo-wrap">
+    <div class="hm-thermo">
+      <div class="hm-thermo-fill" style="height:{pct}%"></div>
+      <div class="hm-thermo-scale"><span>50°</span><span>40°</span><span>30°</span><span>20°</span><span>10°</span></div>
+    </div>
+    <div class="hm-thermo-info">
+      <div class="hm-thermo-val">{_fmt(temp)}<small> °C</small></div>
+      <div class="hm-thermo-row">&gt; {hi:g}°C (ร้อน)</div>
+      <div class="hm-thermo-row ok">{lo:g}–{hi:g}°C (ปกติ)</div>
+      <div class="hm-thermo-row">&lt; {lo:g}°C (เย็น)</div>
+    </div>
+  </div>
+  <div class="hm-tank-foot">อุณหภูมิน้ำปัจจุบัน: <b style="color:#f97316">{_fmt(temp, 2)} °C</b></div>
+</div>""")
+
+
+def header_html(n_rows: int, latest_ts, refresh_label: str, fetched_at: datetime,
+                is_fresh: bool, sheet_url: str) -> str:
+    dot = "#10b981" if is_fresh else "#f59e0b"
+    state = "ออนไลน์" if is_fresh else "ไม่มีข้อมูลใหม่"
+    ts = latest_ts.strftime("%Y-%m-%d %H:%M:%S") if latest_ts is not None and not pd.isna(latest_ts) else "—"
+    return _clean(f"""
+<div class="hm-header">
+  <div class="hm-brand">
+    <div class="hm-title">ระบบโทรมาตร <b>HYDROMETRICS</b> <small>v3.0 · Python</small></div>
+    <div class="hm-sub">ดึงข้อมูลเรียลไทม์จาก Google Sheets พร้อมระบบแจ้งเตือนแยกพารามิเตอร์</div>
+  </div>
+  <div class="hm-meta">
+    <span class="hm-badge">LIVE_SYNC</span>
+    <div><small>SOURCE</small><b class="cyan">GOOGLE SHEETS</b></div>
+    <div><small>REFRESH</small><b>{refresh_label}</b></div>
+    <div><small>LAST FETCH</small><b>{fetched_at:%H:%M:%S}</b></div>
+    <div><small>LATEST DATA</small><b>{ts}</b></div>
+    <span class="hm-online"><i style="background:{dot}"></i>{state} | {n_rows:,} แถว</span>
+    <a class="hm-link" href="{escape(sheet_url)}" target="_blank">เปิดชีต ↗</a>
+  </div>
+</div>""")
+
+
+CSS = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Thai:wght@400;600;700&family=JetBrains+Mono:wght@400;700&display=swap');
+html, body, [class*="css"], .stMarkdown, .stTabs, button, input, label { font-family: 'IBM Plex Sans Thai', sans-serif; }
+.block-container { padding-top: 1.2rem; max-width: 1600px; }
+.hm-header { display:flex; flex-wrap:wrap; gap:16px; justify-content:space-between; align-items:center;
+  border-bottom:1px solid #1e293b; padding-bottom:14px; margin-bottom:8px; }
+.hm-title { font-size:1.35rem; color:#e2e8f0; letter-spacing:.04em; }
+.hm-title b { font-family:'JetBrains Mono',monospace; letter-spacing:.12em; }
+.hm-title small { color:#64748b; font-size:.75rem; font-family:'JetBrains Mono',monospace; }
+.hm-sub { color:#64748b; font-size:.8rem; }
+.hm-meta { display:flex; flex-wrap:wrap; gap:18px; align-items:center; font-family:'JetBrains Mono',monospace; }
+.hm-meta div { display:flex; flex-direction:column; line-height:1.2; }
+.hm-meta small { color:#64748b; font-size:.62rem; letter-spacing:.08em; }
+.hm-meta b { color:#e2e8f0; font-size:.78rem; } .hm-meta b.cyan { color:#22d3ee; }
+.hm-badge { border:1px solid #155e75; background:#083344; color:#22d3ee; padding:3px 10px; border-radius:6px; font-size:.72rem; font-weight:700; }
+.hm-online { border:1px solid #1e293b; background:#0b1220; padding:6px 12px; border-radius:8px; color:#cbd5e1; font-size:.78rem; }
+.hm-online i { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:7px; box-shadow:0 0 8px currentColor; }
+.hm-link { color:#22d3ee !important; font-size:.8rem; text-decoration:none; }
+.hm-section { color:#f1f5f9; font-weight:700; font-size:1.15rem; margin:10px 0 6px; display:flex; justify-content:space-between; align-items:center; }
+.hm-section::before { content:''; width:10px; height:10px; border-radius:50%; background:#22d3ee; margin-right:10px; display:inline-block; }
+.hm-section span { flex:1; } .hm-section small { color:#94a3b8; font-family:'JetBrains Mono',monospace; font-weight:400; font-size:.8rem; }
+
+.hm-card { background:#0b1120; border:1px solid #1e293b; border-left:3px solid var(--accent); border-radius:12px;
+  padding:16px 16px 12px; height:100%; display:flex; flex-direction:column; gap:10px; }
+.hm-card.alert { box-shadow:0 0 0 1px #7f1d1d inset, 0 0 18px -6px #ef4444; }
+.hm-card-head { display:flex; justify-content:space-between; gap:8px; align-items:flex-start; }
+.hm-card-title { color:#e2e8f0; font-weight:700; font-size:.95rem; line-height:1.3; }
+.hm-card-desc { color:#64748b; font-size:.72rem; line-height:1.35; margin-top:2px; }
+.hm-tag { font-family:'JetBrains Mono',monospace; font-size:.62rem; font-weight:700; color:var(--accent);
+  border:1px solid color-mix(in srgb, var(--accent) 45%, transparent); background:color-mix(in srgb, var(--accent) 12%, transparent);
+  padding:2px 7px; border-radius:5px; white-space:nowrap; }
+.hm-value-row { display:flex; align-items:baseline; gap:6px; flex-wrap:wrap; }
+.hm-value { font-family:'JetBrains Mono',monospace; font-size:2.6rem; font-weight:700; color:#f8fafc; line-height:1; }
+.hm-unit { color:#64748b; font-size:1.05rem; font-family:'JetBrains Mono',monospace; margin-right:auto; }
+.hm-delta { font-family:'JetBrains Mono',monospace; font-size:.72rem; font-weight:700; padding:2px 7px; border-radius:6px; }
+.hm-delta.up { color:#34d399; background:#022c22; border:1px solid #065f46; }
+.hm-delta.down { color:#fb7185; background:#2a0a12; border:1px solid #881337; }
+.hm-delta.flat { color:#94a3b8; background:#0f172a; border:1px solid #1e293b; }
+.hm-bars { display:flex; gap:6px; align-items:flex-end; height:22px; border-top:1px solid #1e293b; padding-top:8px; }
+.hm-bar { flex:1; border-radius:2px; }
+.hm-stats { display:flex; justify-content:space-between; font-family:'JetBrains Mono',monospace; font-size:.66rem; color:#64748b; }
+.hm-stats b { color:#cbd5e1; }
+.hm-card-foot { display:flex; justify-content:space-between; align-items:center; font-size:.72rem; }
+.hm-range { color:#64748b; font-family:'JetBrains Mono',monospace; }
+.hm-status { font-size:.72rem; font-weight:700; padding:2px 8px; border-radius:6px; }
+.hm-status.ok { color:#34d399; background:#022c22; border:1px solid #065f46; }
+.hm-status.bad { color:#fb7185; background:#2a0a12; border:1px solid #881337; }
+.hm-status.warn { color:#fbbf24; background:#2a1a04; border:1px solid #78350f; }
+
+.hm-panel { background:#0a0e17; border:1px solid #1e293b; border-radius:12px; padding:14px; height:100%; }
+.hm-panel-head { display:flex; justify-content:space-between; align-items:center; color:var(--accent); font-weight:700; font-size:.92rem; margin-bottom:10px; }
+.hm-chip { font-family:'JetBrains Mono',monospace; font-size:.72rem; color:var(--accent); border:1px solid #1e293b; background:#0f172a; padding:2px 8px; border-radius:6px; }
+.hm-tank { position:relative; height:280px; max-width:240px; margin:0 auto; background:#0f172a; border:2px solid #1e3a5f;
+  border-radius:12px; overflow:hidden; display:flex; flex-direction:column; }
+.hm-tank-sensor { display:flex; justify-content:space-between; font-family:'JetBrains Mono',monospace; font-size:.62rem;
+  color:#94a3b8; background:#1e293b; padding:4px 8px; }
+.hm-tank-sensor span:first-child { color:var(--accent); }
+.hm-tank-air { position:relative; display:flex; justify-content:center; transition:height .6s; }
+.hm-beam { width:0; border-left:2px dashed var(--accent); opacity:.7; height:100%; }
+.hm-beam-label { position:absolute; top:50%; transform:translateY(-50%); font-family:'JetBrains Mono',monospace; font-size:.62rem;
+  color:var(--accent); background:#020617cc; border:1px solid #334155; padding:2px 6px; border-radius:4px; white-space:nowrap; }
+.hm-liquid { margin-top:auto; position:relative; display:flex; align-items:flex-end; justify-content:center; transition:height .6s;
+  box-shadow: inset 0 3px 0 rgba(255,255,255,.35); }
+.hm-liquid-label { font-family:'JetBrains Mono',monospace; font-size:.68rem; color:#fff; font-weight:700; padding:4px; text-shadow:0 1px 2px #000; }
+.hm-tank-foot { text-align:center; color:#94a3b8; font-size:.78rem; margin-top:10px; font-family:'JetBrains Mono',monospace; }
+.hm-tank-foot b { color:#e2e8f0; }
+.hm-thermo-wrap { display:flex; gap:20px; align-items:center; justify-content:center; height:280px;
+  border:1px solid #7c2d12; border-radius:12px; background:#140c08; }
+.hm-thermo { position:relative; width:26px; height:220px; background:#1e293b; border-radius:14px; border:2px solid #334155; overflow:hidden; }
+.hm-thermo-fill { position:absolute; bottom:0; left:0; right:0; background:linear-gradient(to top,#10b981,#f59e0b,#ef4444); border-radius:0 0 12px 12px; }
+.hm-thermo-scale { position:absolute; left:32px; top:0; bottom:0; display:flex; flex-direction:column; justify-content:space-between; }
+.hm-thermo-scale span { font-size:.55rem; color:#64748b; font-family:'JetBrains Mono',monospace; }
+.hm-thermo-info { display:flex; flex-direction:column; gap:8px; margin-left:18px; }
+.hm-thermo-val { font-family:'JetBrains Mono',monospace; font-size:2.2rem; font-weight:700; color:#fff; }
+.hm-thermo-val small { color:#f97316; font-size:1rem; }
+.hm-thermo-row { font-size:.72rem; color:#64748b; font-family:'JetBrains Mono',monospace; }
+.hm-thermo-row.ok { color:#34d399; border:1px solid #065f46; background:#022c22; padding:4px 8px; border-radius:6px; }
+
+.stTabs [data-baseweb="tab-list"] { gap:8px; }
+.stTabs [data-baseweb="tab"] { background:#0b1120; border:1px solid #1e293b; border-radius:8px; padding:6px 16px; }
+.stTabs [aria-selected="true"] { background:#0891b2 !important; color:#fff !important; border-color:#22d3ee; }
+.stTabs [data-baseweb="tab-highlight"], .stTabs [data-baseweb="tab-border"] { display:none; }
+</style>
+"""
