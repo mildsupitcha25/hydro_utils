@@ -53,6 +53,7 @@ class Metric:
     default_min: float
     default_max: float
     alert_msg: str
+    valid_max: float = 100.0   # ค่าเกินนี้ถือว่าเซนเซอร์อ่านผิด (ใช้เมื่อเปิด "กรองค่าผิดปกติ")
 
 
 METRICS: dict[str, Metric] = {
@@ -60,19 +61,19 @@ METRICS: dict[str, Metric] = {
     for m in [
         Metric("waterSensorDistance", "ระยะห่างเซนเซอร์วัดผิวน้ำ", "Water Sensor Distance",
                "ระยะห่างจากหัวเซนเซอร์ถึงระดับผิวน้ำ", "cm", "SENSOR_01", "#0ea5e9",
-               15.0, 28.0, "ระยะเซนเซอร์วัดระดับน้ำผิดปกติ"),
+               15.0, 28.0, "ระยะเซนเซอร์วัดระดับน้ำผิดปกติ", valid_max=50),
         Metric("waterLevel", "ระดับความสูงของน้ำ", "Water Level",
                "ระดับความสูงของน้ำจริงภายในถัง", "cm", "LEVEL_CALC", "#3b82f6",
-               4.5, 25.0, "ระดับน้ำต่ำหรือสูงเกินเกณฑ์ปลอดภัย!"),
+               4.5, 25.0, "ระดับน้ำต่ำหรือสูงเกินเกณฑ์ปลอดภัย!", valid_max=40),
         Metric("colorSensorDistance", "ระยะห่างเซนเซอร์สี", "Color Sensor Distance",
                "ระยะห่างจากเซนเซอร์แสงถึงผิวน้ำยา/สารละลายสี", "cm", "COLOR_01", "#a855f7",
-               15.0, 25.0, "ระยะเซนเซอร์วัดสีผิดปกติ"),
+               15.0, 25.0, "ระยะเซนเซอร์วัดสีผิดปกติ", valid_max=50),
         Metric("colorLevel", "ระดับสารละลายสี", "Color Level",
                "ระดับความสูงของสารละลายสี", "cm", "SAT_INDEX", "#ec4899",
-               5.0, 15.0, "ระดับสารละลายสีไม่ได้มาตรฐาน"),
+               5.0, 15.0, "ระดับสารละลายสีไม่ได้มาตรฐาน", valid_max=40),
         Metric("waterTemperature", "อุณหภูมิน้ำ", "Water Temperature",
                "อุณหภูมิของน้ำแบบเรียลไทม์", "°C", "THERMAL_01", "#f97316",
-               22.0, 35.0, "อุณหภูมิน้ำสูงหรือต่ำเกินกำหนด!"),
+               22.0, 35.0, "อุณหภูมิน้ำสูงหรือต่ำเกินกำหนด!", valid_max=60),
     ]
 }
 METRIC_KEYS = list(METRICS.keys())
@@ -111,6 +112,43 @@ def load_sheet(sheet_url: str, local_csv: str | None = None) -> pd.DataFrame:
     return parse_telemetry(pd.read_csv(src))
 
 
+def remove_outliers(df: pd.DataFrame) -> pd.DataFrame:
+    """ค่า ≤ 0 หรือเกิน valid_max → NaN (ถือว่าเซนเซอร์อ่านผิด)"""
+    df = df.copy()
+    for k, m in METRICS.items():
+        df.loc[(df[k] <= 0) | (df[k] > m.valid_max), k] = float("nan")
+    return df
+
+
+def filter_window(df: pd.DataFrame, minutes: int | None) -> pd.DataFrame:
+    """เลือกข้อมูลย้อนหลัง N นาทีนับจากแถวล่าสุด (None = ทั้งหมด)"""
+    if minutes is None or df.empty:
+        return df
+    return df[df["timestamp"] >= df["timestamp"].iloc[0] - pd.Timedelta(minutes=minutes)]
+
+
+def summary_stats(df: pd.DataFrame, limits: dict[str, tuple[float, float]]) -> pd.DataFrame:
+    """สรุปสถิติต่อพารามิเตอร์ + Cpk (ใช้เกณฑ์เตือนเป็น LSL/USL)"""
+    rows = []
+    for k, m in METRICS.items():
+        s = df[k].dropna()
+        lo, hi = limits[k]
+        n = len(s)
+        mean, sd = (s.mean(), s.std()) if n else (float("nan"), float("nan"))
+        cpk = min(hi - mean, mean - lo) / (3 * sd) if n > 1 and sd > 0 else float("nan")
+        rows.append({
+            "พารามิเตอร์": f"{m.name_th} ({m.unit})",
+            "จำนวน": n,
+            "ล่าสุด": s.iloc[0] if n else None,
+            "ต่ำสุด": s.min(), "สูงสุด": s.max(),
+            "เฉลี่ย": mean, "มัธยฐาน": s.median(), "SD": sd,
+            "P5": s.quantile(.05) if n else None, "P95": s.quantile(.95) if n else None,
+            "% เกินเกณฑ์": ((s < lo) | (s > hi)).mean() * 100 if n else None,
+            "Cpk": cpk,
+        })
+    return pd.DataFrame(rows)
+
+
 def evaluate(value: float, lo: float, hi: float) -> str:
     """คืนค่า 'normal' | 'low' | 'high' | 'nodata'"""
     if value is None or pd.isna(value):
@@ -144,7 +182,13 @@ def delta_badge(cur, prev) -> str:
     return f'<span class="hm-delta {cls}">{arrow} {d:+.1f}</span>'
 
 
-def metric_card_html(m: Metric, series: pd.Series, lo: float, hi: float, stats: dict) -> str:
+def cards_grid_html(cards: list[str]) -> str:
+    """วางการ์ดทั้งหมดใน CSS grid เดียว → ทุกใบสูงเท่ากัน"""
+    return '<div class="hm-grid">' + "".join(cards) + "</div>"
+
+
+def metric_card_html(m: Metric, series: pd.Series, lo: float, hi: float, stats: dict,
+                     stats_label: str = "") -> str:
     cur = series.iloc[0] if len(series) else None
     prev = series.iloc[1] if len(series) > 1 else None
     status = evaluate(cur, lo, hi)
@@ -181,6 +225,7 @@ def metric_card_html(m: Metric, series: pd.Series, lo: float, hi: float, stats: 
     {delta_badge(cur, prev)}
   </div>
   <div class="hm-bars">{bars}</div>
+  <div class="hm-stats-label">สถิติ {escape(stats_label)}</div>
   <div class="hm-stats">
     <span>MIN <b>{_fmt(stats['min'])}</b></span>
     <span>AVG <b>{_fmt(stats['avg'])}</b></span>
@@ -288,17 +333,18 @@ html, body, [class*="css"], .stMarkdown, .stTabs, button, input, label { font-fa
 .hm-section::before { content:''; width:10px; height:10px; border-radius:50%; background:#22d3ee; margin-right:10px; display:inline-block; }
 .hm-section span { flex:1; } .hm-section small { color:#94a3b8; font-family:'JetBrains Mono',monospace; font-weight:400; font-size:.8rem; }
 
+.hm-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(230px, 1fr)); gap:14px; align-items:stretch; }
 .hm-card { background:#0b1120; border:1px solid #1e293b; border-left:3px solid var(--accent); border-radius:12px;
-  padding:16px 16px 12px; height:100%; display:flex; flex-direction:column; gap:10px; }
+  padding:16px 16px 12px; display:flex; flex-direction:column; gap:10px; }
 .hm-card.alert { box-shadow:0 0 0 1px #7f1d1d inset, 0 0 18px -6px #ef4444; }
-.hm-card-head { display:flex; justify-content:space-between; gap:8px; align-items:flex-start; }
+.hm-card-head { display:flex; justify-content:space-between; gap:8px; align-items:flex-start; flex:1 0 auto; }
 .hm-card-title { color:#e2e8f0; font-weight:700; font-size:.95rem; line-height:1.3; }
 .hm-card-desc { color:#64748b; font-size:.72rem; line-height:1.35; margin-top:2px; }
 .hm-tag { font-family:'JetBrains Mono',monospace; font-size:.62rem; font-weight:700; color:var(--accent);
   border:1px solid color-mix(in srgb, var(--accent) 45%, transparent); background:color-mix(in srgb, var(--accent) 12%, transparent);
   padding:2px 7px; border-radius:5px; white-space:nowrap; }
-.hm-value-row { display:flex; align-items:baseline; gap:6px; flex-wrap:wrap; }
-.hm-value { font-family:'JetBrains Mono',monospace; font-size:2.6rem; font-weight:700; color:#f8fafc; line-height:1; }
+.hm-value-row { display:flex; align-items:center; gap:6px; flex-wrap:nowrap; min-height:3rem; }
+.hm-value { font-family:'JetBrains Mono',monospace; font-size:clamp(1.9rem, 2.3vw, 2.6rem); font-weight:700; color:#f8fafc; line-height:1; }
 .hm-unit { color:#64748b; font-size:1.05rem; font-family:'JetBrains Mono',monospace; margin-right:auto; }
 .hm-delta { font-family:'JetBrains Mono',monospace; font-size:.72rem; font-weight:700; padding:2px 7px; border-radius:6px; }
 .hm-delta.up { color:#34d399; background:#022c22; border:1px solid #065f46; }
@@ -308,6 +354,8 @@ html, body, [class*="css"], .stMarkdown, .stTabs, button, input, label { font-fa
 .hm-bar { flex:1; border-radius:2px; }
 .hm-stats { display:flex; justify-content:space-between; font-family:'JetBrains Mono',monospace; font-size:.66rem; color:#64748b; }
 .hm-stats b { color:#cbd5e1; }
+.hm-stats-label { font-size:.6rem; color:#475569; letter-spacing:.06em; margin-bottom:-6px; }
+.hm-delta { white-space:nowrap; flex-shrink:0; }
 .hm-card-foot { display:flex; justify-content:space-between; align-items:center; font-size:.72rem; }
 .hm-range { color:#64748b; font-family:'JetBrains Mono',monospace; }
 .hm-status { font-size:.72rem; font-weight:700; padding:2px 8px; border-radius:6px; }
